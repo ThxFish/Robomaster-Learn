@@ -12,17 +12,16 @@ static DJIMotorInstance *dji_motor_instance[DJI_MOTOR_CNT] = {NULL}; // 会在co
 #define DJI_MOTOR_SENDER_GROUP_CNT (DJI_MOTOR_SENDER_GROUP_PER_CAN * DJI_MOTOR_SENDER_CAN_CNT)
 
 /**
- * @brief 由于DJI电机发送以四个一组的形式进行,故对其进行特殊处理,用9个(3can*3group)can_instance专门负责发送
- *        该变量将在 DJIMotorControl() 中使用,分组在 MotorSenderGrouping()中进行
+ * @brief DJI电机发送缓冲区与实例绑定。
+ *        由于DJI电机硬件特性：每4个电机（例如ID从1到4，或者5到8）共用一个CAN报文发送ID（如0x200）。
+ *        电调通过报文里8个字节中的2个字节来提取自己的电流/电压控制指令。
+ *        所以在这里，我们预先为三个有可能挂载电机的 FDCAN 通道分别分配了 3个发送报文：
+ *        - `0x1FF` (控制部分GM6020和低ID C620)
+ *        - `0x200` (控制ID 1~4 的 C610/C620)
+ *        - `0x2FF` (控制部分GM6020等)
+ *        总共需要 3总线 * 3个报文 = 9个 CANInstance 用来只发不收。
  *
  * @note  因为只用于发送,所以不需要在bsp_can中注册
- *
- * C610(m2006)/C620(m3508):0x1ff,0x200;
- * GM6020:0x1ff,0x2ff
- * 反馈(rx_id): GM6020: 0x204+id ; C610/C620: 0x200+id
- * can1: [0]:0x1FF,[1]:0x200,[2]:0x2FF
- * can2: [3]:0x1FF,[4]:0x200,[5]:0x2FF
- * can3: [6]:0x1FF,[7]:0x200,[8]:0x2FF
  */
 static CANInstance sender_assignment[DJI_MOTOR_SENDER_GROUP_CNT] = {
     [0] = {.can_handle = &hfdcan1, .txconf.Identifier = 0x1ff, .txconf.IdType = FDCAN_STANDARD_ID, .txconf.TxFrameType = FDCAN_DATA_FRAME, .txconf.DataLength = FDCAN_DLC_BYTES_8, .tx_buff = {0}},
@@ -61,8 +60,17 @@ static uint8_t GetCanBusIdx(FDCAN_HandleTypeDef *can_handle)
 }
 
 /**
- * @brief 根据电调/拨码开关上的ID,根据说明书的默认id分配方式计算发送ID和接收ID,
- *        并对电机进行分组以便处理多电机控制命令
+ * @brief  将新注册的DJI电机根据其拨码ID和所属的CAN总线，挂载并分组到准备好的 `sender_assignment` 之中。
+ *
+ * @note   原理总结：大疆的 C610/C620 (M2006/M3508) 控制报文和 GM6020 有差异。
+ *         1. C620: ID 1-4 返回帧从 0x201-0x204，用 0x200 帧来统一控制；ID 5-8 放 0x1FF 来统一控制。
+ *         2. GM6020: ID 1-4 返回帧从 0x205-0x208，也是在 0x1FF 帧；ID 5-7 就是 0x2FF。
+ *         本函数将电机的实例结构体里的 `message_num` 指定为报文中的哪两个字节(0~3)，
+ *         并将 `sender_group` 指定为我们上面定义的 9长数组中的哪一个。
+ *         这样将来调用 `DJIMotorControl()` 更新电流时就能直接覆写缓冲里相应字节了。
+ *
+ * @param  motor  将要填充绑定信息的电机句柄。
+ * @param  config APP层传入的初始化配置，用于提供它属于哪条CAN线、它是几号ID。
  */
 static void MotorSenderGrouping(DJIMotorInstance *motor, CAN_Init_Config_s *config)
 {
@@ -141,10 +149,18 @@ static void MotorSenderGrouping(DJIMotorInstance *motor, CAN_Init_Config_s *conf
 }
 
 /**
- * @todo  是否可以简化多圈角度的计算？
- * @brief 根据返回的can_instance对反馈报文进行解析
+ * @brief DJI电机专用的CAN接收回调函数。这也就是在 bsp_can 中遍历调用的那一段代码。
  *
- * @param _instance 收到数据的instance,通过遍历与所有电机进行对比以选择正确的实例
+ * @note  工作机制：
+ *        CAN模块(如 FDCAN FIFO 中断)一旦识别报文 ID(例如 0x201 属于1号 M3508)
+ *        对应上之后，就会跳转到这里，同时传入存放在实例结构体中的那 8 Bytes 数据：
+ *        byte[0-1] -> ecd: 此时转子处于圈内的绝对机械角度 (0~8191，对应0-360)
+ *        byte[2-3] -> speed_rpm: 此时电机的转速，单位RPM
+ *        byte[4-5] -> current: 此时电机输出的力矩电流 (并非实际A，而是换算的整数值，如 -16384~16384)
+ *        byte[6]   -> temperature: 此时电机电调的温度
+ *        本函数收到后不仅拆包存入 `motor->measure`，还顺带做了多圈角度(总度数)的心智计算。
+ *
+ * @param _instance 对应报文触发的此电机的CAN实例句柄
  */
 static void DecodeDJIMotor(CANInstance *_instance)
 {
@@ -154,10 +170,12 @@ static void DecodeDJIMotor(CANInstance *_instance)
     DJIMotorInstance *motor = (DJIMotorInstance *)_instance->id;
     DJI_Motor_Measure_s *measure = &motor->measure; // measure要多次使用,保存指针减小访存开销
 
+    // 测算两帧数据之间经过了多少ms时间差 dt (用于后续做 PID 的 I 和 D 项的时间积分导数计算)
     // DaemonReload(motor->daemon);
     motor->dt = DWT_GetDeltaT(&motor->feed_cnt);
 
-    // 解析数据并对电流和速度进行滤波,电机的反馈报文具体格式见电机说明手册
+    // 解析数据并对电流和角速度进行一阶低通滤波 (一阶IIR滤波器)
+    // alpha = 1.0 - smooth_coef, 只有 smooth_coef 越小，反应越快，但在电机跳动大时也容易受噪音干扰
     measure->last_ecd = measure->ecd;
     measure->ecd = ((uint16_t)rxbuff[0]) << 8 | rxbuff[1];
     measure->angle_single_round = ECD_ANGLE_COEF_DJI * (float)measure->ecd;
@@ -167,7 +185,10 @@ static void DecodeDJIMotor(CANInstance *_instance)
                             CURRENT_SMOOTH_COEF * (float)((int16_t)(rxbuff[4] << 8 | rxbuff[5]));
     measure->temperature = rxbuff[6];
 
-    // 多圈角度计算,前提是假设两次采样间电机转过的角度小于180°,自己画个图就清楚计算过程了
+    // 多圈绝对角度计算核心算法：
+    // 每当电机经过物理过零点（ecd 一瞬间从 8191 跳变为 0，意味着过圈了向正转走；或者从 0 跳变 8191 倒过圈），
+    // 因为这通常很快，所以 ecd_new - ecd_old 会有一个剧烈的跳变如接近 -8191 或 +8191。
+    // 如果它比 -4096 (半圈极值) 还要小得多，说明是过了圈（从 8191 -> 0 跨半圈不可能），必须是转了一圈，需要 total_round++。
     if (measure->ecd - measure->last_ecd > 4096)
         measure->total_round--;
     else if (measure->ecd - measure->last_ecd < -4096)
@@ -205,7 +226,10 @@ DJIMotorInstance *DJIMotorInit(Motor_Init_Config_s *config)
     // 电机分组,因为至多4个电机可以共用一帧CAN控制报文
     MotorSenderGrouping(instance, &config->can_init_config);
 
-    // 注册电机到CAN总线
+    // 这里是这套 DJI Motor APP 层和 Module 层对接的最重要注册环节：
+    // 这几行代码向 BSP 层的 `bsp_can.c` 提交了当前这台电机的收发心愿单。
+    // 尤其核心的是 `DecodeDJIMotor` 这个解析回调函数传入了 `can_module_callback`。
+    // 即：底层FIFO一收到 ID 匹配该电机的报文，就会无脑中断调用 `DecodeDJIMotor` 来剖解这8个字节。
     config->can_init_config.can_module_callback = DecodeDJIMotor; // set callback
     config->can_init_config.id = instance;                        // set id,eq to address(it is identity)
     instance->motor_can_instance = CANRegister(&config->can_init_config);
@@ -250,13 +274,21 @@ void DJIMotorOuterLoop(DJIMotorInstance *motor, Closeloop_Type_e outer_loop)
     motor->motor_settings.outer_loop_type = outer_loop;
 }
 
-// 设置参考值
+// 设置参考值（云台或者底盘应用调用这个，下发目标坐标/转速）
 void DJIMotorSetRef(DJIMotorInstance *motor, float ref)
 {
     motor->motor_controller.pid_ref = ref;
 }
 
-// 为所有电机实例计算三环PID,发送控制报文
+/**
+ * @brief  DJI电机的心跳任务，为所有电机实例计算三环 PID，发送控制 CAN 报文。
+ *
+ * @note   调用位置：此函数将在 `MotorTask` 任务函数中以极高频 (例如 1000Hz) 循环调用。
+ *         核心原理解读：
+ *         这里是串级PID的落地点。位置(角度)PID 的输出作为 速度PID 的设定值；
+ *         速度PID的输出作为 电流(力矩)PID 的设定值。
+ *         经过层层逼近并加上前馈，最后算得的电流 `pid_ref` 将被塞入 CAN 缓冲数组 `sender_assignment` 中。
+ */
 void DJIMotorControl()
 {
     // 直接保存一次指针引用从而减小访存的开销,同样可以提高可读性

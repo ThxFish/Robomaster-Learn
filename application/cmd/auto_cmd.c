@@ -32,18 +32,18 @@ typedef enum
     MATCH_START_STAGE_LOOP,
 } MatchStartStage_e;
 
-static Publisher_t *chassis_cmd_pub;   // 底盘控制消息发布者
-static Subscriber_t *chassis_feed_sub; // 底盘反馈信息订阅者
+static Publisher_t *chassis_cmd_pub;             // 底盘控制消息发布者
+static Subscriber_t *chassis_feed_sub;           // 底盘反馈信息订阅者
 static Chassis_Ctrl_Cmd_s chassis_cmd_send;      // 发送给底盘应用的信息
-static Chassis_Upload_Data_s chassis_fetch_data;   // 从底盘应用接收的反馈信息
+static Chassis_Upload_Data_s chassis_fetch_data; // 从底盘应用接收的反馈信息
 
 static Publisher_t *gimbal_cmd_pub;            // 云台控制消息发布者
 static Subscriber_t *gimbal_feed_sub;          // 云台反馈信息订阅者
 static Gimbal_Ctrl_Cmd_s gimbal_cmd_send;      // 传递给云台的控制信息
 static Gimbal_Upload_Data_s gimbal_fetch_data; // 从云台获取的反馈信息
 
-static Publisher_t *shoot_cmd_pub;           // 发射控制消息发布者
-static AUTO_Fire_Ctrl_Cmd_s shoot_cmd_send;  // 传递给发射的控制信息
+static Publisher_t *shoot_cmd_pub;          // 发射控制消息发布者
+static AUTO_Fire_Ctrl_Cmd_s shoot_cmd_send; // 传递给发射的控制信息
 
 static vtm_info_t *vtm_data; // 遥控器数据,初始化时返回
 static Vision_Rx_s *vision_rx_data;
@@ -63,10 +63,10 @@ static MatchStartStage_e match_start_stage;
 static float match_start_stage_elapsed;
 
 static const DRNavWaypoint_s auto_nav_route[AUTO_NAV_POINT_CNT] = {
-    {0.80f, 0.00f, 0.0f,      0.90f, 1.80f, 0.12f},
+    {0.80f, 0.00f, 0.0f, 0.90f, 1.80f, 0.12f},
     {0.80f, 1.00f, PI * 0.5f, 0.85f, 1.70f, 0.12f},
-    {0.00f, 1.00f, PI,         0.85f, 1.70f, 0.12f},
-    {0.00f, 0.00f, -PI * 0.5f,0.90f, 1.80f, 0.12f},
+    {0.00f, 1.00f, PI, 0.85f, 1.70f, 0.12f},
+    {0.00f, 0.00f, -PI * 0.5f, 0.90f, 1.80f, 0.12f},
 };
 
 static float WrapRad(float angle)
@@ -96,10 +96,9 @@ void AUTOCMDInit()
         .can_config = {
             .can_handle = &hfdcan1,
             .rx_id = 0x498,
-            .tx_id = 0x486
-        },
+            .tx_id = 0x486},
     };
-    
+
     chassis_cmd_pub = PubRegister("chassis_cmd", sizeof(Chassis_Ctrl_Cmd_s));
     chassis_feed_sub = SubRegister("chassis_feed", sizeof(Chassis_Upload_Data_s));
     gimbal_cmd_pub = PubRegister("gimbal_cmd", sizeof(Gimbal_Ctrl_Cmd_s));
@@ -129,7 +128,7 @@ void AUTOCMDInit()
 
     shoot_cmd_send.state = FIRE_OFF;
 
-    ctrl_cnt = DWT->CYCCNT;  // 用当前计数值初始化，避免首次dt过大
+    ctrl_cnt = DWT->CYCCNT; // 用当前计数值初始化，避免首次dt过大
     last_mode_switch = 0xFF;
     last_button_left = 0;
     last_button_right = 0;
@@ -138,6 +137,12 @@ void AUTOCMDInit()
     match_start_stage_elapsed = 0.0f;
 }
 
+/**
+ * @brief  自动步兵/哨兵的大脑指令中枢任务。
+ *         这个任务在 FreeRTOS 中会以比如 100Hz 运行。
+ *         它不直接操作任何电机，而是搜集各个感知模块的数据（遥控器、视觉、裁判系统），经过决策逻辑，
+ *         再下发给具体的执行层(如底盘、云台控制app)。
+ */
 static void AUTOVTMControlSet()
 {
     float delta_time = DWT_GetDeltaT(&ctrl_cnt);
@@ -147,7 +152,7 @@ static void AUTOVTMControlSet()
     // if (delta_time < 0.0001f)
     //     delta_time = 0.0001f;
 
-    #ifdef DEBUG
+#ifdef DEBUG
     if (mode_switch != last_mode_switch)
     {
         if (mode_switch == 2)
@@ -163,42 +168,46 @@ static void AUTOVTMControlSet()
         }
         last_mode_switch = mode_switch;
     }
-    #endif
+#endif
 
-    // 处理摇杆
+    // 处理大疆遥控器(DBUS)拨杆数据，归一化到 [-1, 1] 方便计算
+    // 在这里我们将遥控器的机械原始刻度转化为控制数学域可以理解的小数系数。
     float stick_RH, stick_RV, stick_LV, stick_LH, dial; // 归一到[-1,1]的摇杆数据
-    stick_RH = (float) (vtm_data->rc_ctrl.rc.bit.stick_RH - RC_CH_VALUE_OFFSET) / (float) (RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
-    stick_RV = (float) (vtm_data->rc_ctrl.rc.bit.stick_RV - RC_CH_VALUE_OFFSET) / (float) (RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
-    stick_LH = (float) (vtm_data->rc_ctrl.rc.bit.stick_LH - RC_CH_VALUE_OFFSET) / (float) (RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
-    stick_LV = (float) (vtm_data->rc_ctrl.rc.bit.stick_LV - RC_CH_VALUE_OFFSET) / (float) (RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
-    dial = (float) (vtm_data->rc_ctrl.rc.bit.dial - RC_CH_VALUE_OFFSET) / (float) (RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
+    stick_RH = (float)(vtm_data->rc_ctrl.rc.bit.stick_RH - RC_CH_VALUE_OFFSET) / (float)(RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
+    stick_RV = (float)(vtm_data->rc_ctrl.rc.bit.stick_RV - RC_CH_VALUE_OFFSET) / (float)(RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
+    stick_LH = (float)(vtm_data->rc_ctrl.rc.bit.stick_LH - RC_CH_VALUE_OFFSET) / (float)(RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
+    stick_LV = (float)(vtm_data->rc_ctrl.rc.bit.stick_LV - RC_CH_VALUE_OFFSET) / (float)(RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
+    dial = (float)(vtm_data->rc_ctrl.rc.bit.dial - RC_CH_VALUE_OFFSET) / (float)(RC_CH_VALUE_MAX - RC_CH_VALUE_OFFSET);
 
-    float vx_gimbal, vy_gimbal; // 云台坐标系下的速度,x轴正方向朝前,y轴正方向朝左
-    float vx_chassis, vy_chassis; // 底盘坐标系下的速度,x轴正方向朝前,y轴正方向朝左
-    float diff_angle; // 底盘坐标系相对于云台坐标系的旋转角
+    float vx_gimbal, vy_gimbal;   // 操作手期望在云台坐标系下的速度,x轴正方向朝前,y轴正方向朝左
+    float vx_chassis, vy_chassis; // 底盘实际需要的参考速度(把操作下压到底盘坐标系),x轴正方向朝前,y轴正方向朝左
+    float diff_angle;             // 底盘坐标系系相对于云台系坐标系的夹角（偏航角）
 
-    // 将yaw_deg([0,360]°)转换为弧度([-pi,pi])
+    // 将云台回传回来的当下的 yaw_deg([0,360]°)转换为弧度([-pi,pi])
     diff_angle = gimbal_fetch_data.yaw_deg * DEGREE_2_RAD; // [0, 2pi]
     if (diff_angle > PI)
         diff_angle -= PI2; // [-pi, pi]
 
-    // 摇杆输入为云台坐标系
+    // 把左摇杆直接拉满映射成最大 2.0 m/s 的云台坐标系平移速度
     vx_gimbal = stick_LV * 2.0f;
     vy_gimbal = stick_LH * -2.0f;
 
-    /* 使用旋转矩阵计算底盘坐标系下的速度
+    /* 经典的小陀螺/云台跟随平移解算：使用旋转矩阵将云台系的指令投影到底盘系
+     * 为什么要有这一步？因为我们在操作时，是以“枪管朝哪，哪里就是前”来打摇杆的。
+     * 但底盘有自己的“车头”，只要算出这俩的差角作二维旋转矩阵变换，
+     * 底盘就能算出为了实现“顺着枪管方向走”自己四个轮子该怎么动。
+     *
      * R = [cos(diff_angle) -sin(diff_angle)]
      *     [sin(diff_angle)  cos(diff_angle)]
      */
     vx_chassis = arm_cos_f32(diff_angle) * vx_gimbal - arm_sin_f32(diff_angle) * vy_gimbal;
     vy_chassis = arm_sin_f32(diff_angle) * vx_gimbal + arm_cos_f32(diff_angle) * vy_gimbal;
 
-
-    // 云台控制增量是摇杆对时间的积分
+    // 云台控制则不是绝对位置，而是增量控制（摇杆打到底表示以最大速度转头），所以需要对 delta_time 进行时间积分
     yaw_gimbal += stick_RH * -180 * delta_time;
     pitch_gimbal += stick_RV * 90 * delta_time;
 
-    #ifdef DEBUG
+#ifdef DEBUG
     switch (mode_switch)
     {
     case 0: // 底盘云台分离
@@ -295,9 +304,9 @@ static void AUTOVTMControlSet()
         shoot_cmd_send.state = FIRE_OFF;
         break;
     }
-    #endif // DEBUG
+#endif // DEBUG
 
-    #ifndef DEBUG
+#ifndef DEBUG
     switch (mode_switch)
     {
     case 2: // 底盘云台分离
@@ -313,7 +322,7 @@ static void AUTOVTMControlSet()
         gimbal_cmd_send.gimbal_mode = GIMBAL_IMU;
         shoot_cmd_send.state = trigger_pressed ? FIRE_ON : FIRE_OFF;
         break;
-    
+
     default:
         uint8_t game_progress = referee_data->GameState.game_progress;
 
@@ -394,14 +403,14 @@ static void AUTOVTMControlSet()
             break;
         }
     }
-    #endif // !DEBUG
+#endif // !DEBUG
 }
 
 void AUTOCMDTask()
 {
     // 从底盘应用接收反馈信息
     SubGetMessage(chassis_feed_sub, (void *)&chassis_fetch_data);
-    
+
     // 从云台应用接收反馈信息
     SubGetMessage(gimbal_feed_sub, (void *)&gimbal_fetch_data);
 
@@ -424,7 +433,7 @@ void AUTOCMDTask()
     // supercap_data[1] = (uint8_t)referee_data->PowerHeatData.buffer_energy;
     // supercap_data[2] = (uint8_t)0;
     // SuperCapSend(tony_supercap, supercap_data);
-    
+
     // 发送控制信息给底盘应用
     PubPushMessage(chassis_cmd_pub, (void *)&chassis_cmd_send);
 

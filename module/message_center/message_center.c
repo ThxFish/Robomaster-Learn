@@ -29,6 +29,21 @@ static void CheckLen(uint8_t len1, uint8_t len2)
     }
 }
 
+/**
+ * @brief  PubRegister: 发布者(某个数据或指令的源头)向系统注册一个“话题”(Topic)。
+ *
+ * @note   工作原理：这是 Pub-Sub 架构的核心构建块。
+ *         比如 Robot_Cmd 任务想要对外广播 “底盘速度控制量”。它并不需要知道到底是哪个C文件里的底盘任务在运行。
+ *         它只要调用这个函数，说：“我要建立一个名叫 'cmd_chassis' 的话题，我每次发的数据包长度是 16 个字节”。
+ *         函数会从 message_center 虚拟头节点开始遍历纵向单链表：
+ *         1. 如果这个话题名存在了（可能被别人先注册订阅了），就补充返回话题的指针给调用方。
+ *         2. 如果不存在，就在链表尾部再 `malloc` 画出一个新的 Topic 节点。
+ *          这样一纵列的话题名就建立起来了。
+ *
+ * @param  name      话题的唯一字符串名称
+ * @param  data_len  这一个话题每次通信交互的字节长度（如 sizeof(Chassis_Cmd_s)）
+ * @retval Publisher_t* 返回指向该话题大节点（纵向节点）的指针，以后用来塞数据。
+ */
 Publisher_t *PubRegister(char *name, uint8_t data_len)
 {
     CheckName(name);
@@ -52,6 +67,18 @@ Publisher_t *PubRegister(char *name, uint8_t data_len)
     return node->next_topic_node;
 }
 
+/**
+ * @brief  SubRegister: 订阅侧(想要别人数据的模块) 在指定话题名下面，开辟自己的专属“收货信箱队列”。
+ *
+ * @note   工作原理：这构成了 Pub-Sub 的横向链表。
+ *         1. 先看看有没有关于 `name` 这个话题（Publisher_t），如果没有也连带创一个。
+ *         2. 为自己这个模块分配一个 `Subscriber_t` 的盒子实例。并在这个盒子里，分配 `QUEUE_SIZE`(比如3个长度) 的接收缓冲数组。
+ *         3. 然后把它自己挂载到这个对应话题所在的“横向专属订阅链表”尾部 (`next_subs_queue`)。
+ *         这样：横向所有的邮箱结构体（`Subscriber_t`）就串联在了某一个 `Publisher_t` 的麾下。
+ *
+ * @param  name     你要接听的话题名字
+ * @param  data_len 这个话题下这包数据原本有多大，以此向系统索要相应的 Malloc 内存来存缓冲。
+ */
 Subscriber_t *SubRegister(char *name, uint8_t data_len)
 {
     Publisher_t *pub = PubRegister(name, data_len); // 查找或创建该话题的发布者
@@ -80,6 +107,18 @@ Subscriber_t *SubRegister(char *name, uint8_t data_len)
     return ret;
 }
 
+/**
+ * @brief  SubGetMessage: 订阅者从自己的专属缓冲区里把别人发来的数据包“取出来”( Pop 操作)。
+ *
+ * @note   工作原理：这是一个使用取模 `% QUEUE_SIZE` 构成的最经典的“环形FIFO队列”。
+ *         如果当前这个话题真的有数据(`temp_size > 0`)，
+ *         就从 `front_idx`(最新的队列读出指针) 所在的地方 `memcpy` 拷贝出来一份。
+ *         所以这个函数既是阻塞，也是非阻塞的：你可以配合 FreeRTOS 轮询它，如果别人没发，就返回 0 让你继续睡觉。
+ *
+ * @param  sub        调用刚才注册时返回的那个 `Subscriber_t` 对象（自己的私有信箱）
+ * @param  data_ptr   准备用来承接这几十、几十个字节的一级或者多级结构体容器指针。
+ * @retval uint8_t    取出成功返回 1；没有新数据信箱空空如也返回 0。
+ */
 /* 如果队列为空,会返回0;成功获取数据,返回1;后续可以做更多的修改,比如剩余消息数目等 */
 uint8_t SubGetMessage(Subscriber_t *sub, void *data_ptr)
 {
@@ -93,6 +132,20 @@ uint8_t SubGetMessage(Subscriber_t *sub, void *data_ptr)
     return 1;
 }
 
+/**
+ * @brief  PubPushMessage: 由数据的源头模块调用，将整理好的报文信息推送到所有监听这话题的信箱。
+ *
+ * @note   工作逻辑：这是整个多任务发布订阅的灵魂广播动作。
+ *         当某个话题的源头 `pub` （比如 Robot_cmd 计算好了下发指令后调用它），
+ *         它不关心有几个底盘、几个发射云台连了它。它只做一件事：
+ *         顺着 `next_subs_queue` 这个单链表，摸出一个接一个的接收方（`Subscriber_t`结构体）。
+ *         把自身发出来的这帧总字节（`data_ptr`） ，挨个 `memcpy` 复制塞进它们每个人各自的私有接收缓冲队列(`queue`) 最后 (`back_idx`)。
+ *         如果对方太忙来不及收满塞爆了怎么办？最老的包会被直接循环覆盖（抛弃）。
+ *
+ * @param  pub       你作为发布源所在的话题 `Publisher_t` 节点
+ * @param  data_ptr  这帧消息(比如 16字节的结构体指针)的来源地址。
+ * @retval 恒返回1
+ */
 uint8_t PubPushMessage(Publisher_t *pub, void *data_ptr)
 {
     static Subscriber_t *iter;

@@ -19,11 +19,15 @@ static Subscriber_t *gimbal_sub;                  // cmd控制消息订阅者
 static Gimbal_Upload_Data_s gimbal_feedback_data; // 回传给cmd的云台状态信息
 static Gimbal_Ctrl_Cmd_s gimbal_cmd_recv;         // 来自cmd的控制信息
 
-// static BMI088Instance *bmi088; // 云台IMU
+// 云台初始化：负责分配电机实例、填写PID、绑定IMU反馈数据指针，并建立PUB/SUB连接。
 void GimbalInit()
 {
+    // 获取由 INStask(惯性导航解算任务) 计算出的最新设备空间姿态指针
     gimbal_IMU_data = INS_Init();
-    // YAW
+    // YAW 轴(大疆GM6020电机) 初始化配置
+    // 这里体现了高度的模块化：直接把“IMU的Yaw角度指针”和“Z轴陀螺仪角速度指针”
+    // 塞给了DJI_MOTOR模块的PID。
+    // 这样底层一计算位置环和速度环，自然读到的就是外界陀螺仪的真实空间姿态，而不是电机转子的相对度数。
     Motor_Init_Config_s yaw_config = {
         .can_init_config = {
             .can_handle = &hfdcan1,
@@ -60,17 +64,18 @@ void GimbalInit()
             .close_loop_type = ANGLE_LOOP | SPEED_LOOP,
             .motor_reverse_flag = MOTOR_DIRECTION_NORMAL,
         },
-        .motor_type = GM6020
-    };
-    // PITCH
+        .motor_type = GM6020};
+
+    // PITCH 轴 (小米CyberGear电机)
+    // 根据小米电机的特性，它往往支持MIT模式(力矩/位置/速度混合阻抗控制)，此处使用Kp和Kd。
     Motor_Init_Config_s xm_config = {
         .can_init_config = {
             .can_handle = &hfdcan3,
-            .rx_id = 1,  // 电机ID (1~127)
+            .rx_id = 1, // 电机ID (1~127)
         },
         .controller_param_init_config = {
-            .angle_PID = { .Kp = 20.0f },   // MIT模式位置Kp
-            .speed_PID = { .Kd = 1.0f },   // MIT模式阻尼Kd
+            .angle_PID = {.Kp = 20.0f}, // MIT模式位置Kp
+            .speed_PID = {.Kd = 1.0f},  // MIT模式阻尼Kd
         },
         .controller_setting_init_config = {
             .motor_reverse_flag = MOTOR_DIRECTION_NORMAL,
@@ -86,22 +91,31 @@ void GimbalInit()
     gimbal_sub = SubRegister("gimbal_cmd", sizeof(Gimbal_Ctrl_Cmd_s));
 }
 
-/* 机器人云台控制核心任务,后续考虑只保留IMU控制,不再需要电机的反馈 */
+/* 机器人云台控制核心循环任务。该任务在 RTOS 中的 `sentry.c` 等文件中周期调度 */
 void GimbalTask()
 {
-    // 获取云台控制数据
-    // 后续增加未收到数据的处理
+    // 非阻塞式获取中枢指令：尝试从队列拿到最新的控制命令(包括期望Pitch、Yaw角度以及工作模式)。
+    // 若没拿到， `gimbal_cmd_recv` 的值将维持上一次的缓存。
+    // 后续可增加超时断开保护机制
     SubGetMessage(gimbal_sub, &gimbal_cmd_recv);
 
+    // 对 Pitch 轴 (小米电机)的独立运动算法控制
     switch (gimbal_cmd_recv.gimbal_mode)
     {
-        case GIMBAL_IMU:
-        case GIMBAL_LOCK:
+    case GIMBAL_IMU:
+    case GIMBAL_LOCK:
+        // 取出控制台下发的期望 Pitch 角度
         float target_imu_angle = gimbal_cmd_recv.pitch;
+        // 计算与实际 IMU 姿态的误差
         float imu_error = target_imu_angle - gimbal_IMU_data->Pitch;
-        float mit_target_angle = xm_motor->measure.position  + 1.0 * imu_error * DEGREE_2_RAD;
+
+        // 算出小米电机期望达到的相对目标物理位置(需要把 IMU角度差 叠加到 电机当前的转子位置 上)
+        float mit_target_angle = xm_motor->measure.position + 1.0 * imu_error * DEGREE_2_RAD;
+
+        // 速度补偿：为了抵抗陀螺仪读出的角速度干扰，这里向该方向产生反作用虚拟速度，减小动态超调
         float mit_target_speed = xm_motor->measure.velocity - 1.0 * gimbal_IMU_data->Gyro[0];
 
+        // 对算出的小米电机实际下发位置做硬限幅保护，防止云台磕到底盘或限位架
         if (mit_target_angle > PITCH_MAX_RAD)
         {
             mit_target_angle = PITCH_MAX_RAD;
@@ -122,20 +136,25 @@ void GimbalTask()
 
         DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw);
         XMMotorEnable(xm_motor);
+        // Pitch 轴力矩控制输出给小米驱动层
         XMMotorSetRef(xm_motor, mit_target_angle, mit_target_speed, 0);
         break;
     default:
         break;
     }
 
+    // 对 Yaw 轴 (大疆GM6020大电机)的特化算法控制
     switch (gimbal_cmd_recv.gimbal_mode)
     {
     case GIMBAL_IMU:
+        // 在陀螺仪增稳模式下：强制将大疆电机的闭环反馈源头切为 IMU陀螺仪，实现地磁系中“钉死”一个角度。
         DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, OTHER_FEED);
         DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, OTHER_FEED);
-        DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw);
+        DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw); // 将摇杆要求的中枢控制Yaw给下去
         break;
     case GIMBAL_LOCK:
+        // 在底盘跟随锁定模式下：切回电机自己的编码器读数。
+        // 这时它的目标就成了“把自身的转子刻度掰回到车头正前方对齐”。也就是所谓的“车云协同解耦控制”。
         DJIMotorChangeFeed(yaw_motor, ANGLE_LOOP, MOTOR_FEED);
         DJIMotorChangeFeed(yaw_motor, SPEED_LOOP, MOTOR_FEED);
         DJIMotorSetRef(yaw_motor, YAW_CHASSIS_ALIGN_DEG);
@@ -144,10 +163,11 @@ void GimbalTask()
         break;
     }
 
+    // 最后，作为 Pub-Sub 中的“勤勤恳恳”节点，将自己此时此刻的真实云台方位向全网散播（尤其发给中枢和底盘任务用作正运动解算），完成逻辑闭环。
     gimbal_feedback_data.yaw_deg = yaw_motor->measure.total_angle - YAW_CHASSIS_ALIGN_DEG;
     gimbal_feedback_data.yaw_speed = yaw_motor->measure.speed_aps;
 
-    // DJIMotorSetRef(yaw_motor, gimbal_cmd_recv.yaw);
+    PubPushMessage(gimbal_pub, (void *)&gimbal_feedback_data);
     // XMMotorSetRef(xm_motor, gimbal_cmd_recv.pitch, 0.0f, 0.0f);
 
     // @todo:现在已不再需要电机反馈,实际上可以始终使用IMU的姿态数据来作为云台的反馈,yaw电机的offset只是用来跟随底盘

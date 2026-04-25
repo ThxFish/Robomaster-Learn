@@ -8,36 +8,34 @@
 
 #include "arm_math.h"
 
-
 /* 舵轮参数 */
-#define WHEEL_SPEED_SCALE (360.0f / PERIMETER_WHEEL * REDUCTION_RATIO_WHEEL)  // 轮速转换系数:m/s -> deg/s (线速度/周长×360°×减速比)
+#define WHEEL_SPEED_SCALE (360.0f / PERIMETER_WHEEL * REDUCTION_RATIO_WHEEL) // 轮速转换系数:m/s -> deg/s (线速度/周长×360°×减速比)
 #define CHASSIS_FEEDBACK_RC 0.03f
 
-static Publisher_t *chassis_pub;                    // 用于发布底盘的数据
-static Subscriber_t *chassis_sub;                   // 用于订阅底盘的控制命令
+static Publisher_t *chassis_pub;  // 用于发布底盘的数据
+static Subscriber_t *chassis_sub; // 用于订阅底盘的控制命令
 
 static Chassis_Ctrl_Cmd_s chassis_cmd_recv;         // 底盘接收到的控制命令
 static Chassis_Upload_Data_s chassis_feedback_data; // 底盘回传的反馈数据
 
 /* 舵轮电机实例 */
-static DJIMotorInstance *wheel_motor[4];  // 轮毂电机: [0]右上 [1]右下 [2]左下 [3]左上
-static DJIMotorInstance *steer_motor[4];  // 舵面电机: [0]右上 [1]右下 [2]左下 [3]左上
+static DJIMotorInstance *wheel_motor[4]; // 轮毂电机: [0]右上 [1]右下 [2]左下 [3]左上
+static DJIMotorInstance *steer_motor[4]; // 舵面电机: [0]右上 [1]右下 [2]左下 [3]左上
 
 /* 私有函数计算的中介变量,设为静态避免参数传递的开销 */
-static float vx, vy, wz;               // 底盘速度指令
+static float vx, vy, wz;                                             // 底盘速度指令
 static float vx_rf, vy_rf, vx_rb, vy_rb, vx_lb, vy_lb, vx_lf, vy_lf; // 各轮速度分量
-static float wheel_speed[4];           // 各轮速度值(deg/s)
-static float steer_angle[4];           // 各轮角度(度)
-static float target_wheel_speed[4];    // 目标轮速(度/秒)
-static float target_steer_angle[4];    // 目标舵面角度(度)
-static int8_t wheel_dir_flag[4] = {1, 1, 1, 1};  // 轮速方向标志
-static uint32_t feedback_cnt; // 反馈解算时间戳
+static float wheel_speed[4];                                         // 各轮速度值(deg/s)
+static float steer_angle[4];                                         // 各轮角度(度)
+static float target_wheel_speed[4];                                  // 目标轮速(度/秒)
+static float target_steer_angle[4];                                  // 目标舵面角度(度)
+static int8_t wheel_dir_flag[4] = {1, 1, 1, 1};                      // 轮速方向标志
+static uint32_t feedback_cnt;                                        // 反馈解算时间戳
 
 // 舵面偏移角度数组
 static const float steer_offset[4] = {
     RF_WHEEL_POS_OFFSET_ANGLE, RB_WHEEL_POS_OFFSET_ANGLE,
-    LB_WHEEL_POS_OFFSET_ANGLE, LF_WHEEL_POS_OFFSET_ANGLE
-};
+    LB_WHEEL_POS_OFFSET_ANGLE, LF_WHEEL_POS_OFFSET_ANGLE};
 
 static float Clampf(float value, float min, float max)
 {
@@ -48,18 +46,18 @@ static float Clampf(float value, float min, float max)
     return value;
 }
 
-
 /**
- * @brief 舵轮运动学解算
- *        将底盘控制指令(vx, vy, wz)解算为各轮子的速度和舵面角度
+ * @brief 舵轮底盘运动学正逆解核心算法计算
+ *        将控制中枢下发的底盘整体控制指令(vx推推杆, vy平移推杆, wz旋转摇杆)
+ *        分解给四个独立悬挂的舵轮（每个舵轮由一个控制朝向的“舵向电机”和一个控制转速的“轮毂电机”组成）。
  */
 static void AGVKinematicsCalculate()
 {
-    vx = chassis_cmd_recv.vx;  // 前进方向速度(m/s)
-    vy = chassis_cmd_recv.vy;  // 横移方向速度(m/s)
-    wz = chassis_cmd_recv.wz;  // 旋转角速度(rad/s)
+    vx = chassis_cmd_recv.vx; // 前进方向速度(m/s)
+    vy = chassis_cmd_recv.vy; // 横移方向速度(m/s)
+    wz = chassis_cmd_recv.wz; // 旋转角速度(rad/s)
 
-    for(int i = 0; i < 4; i++)
+    for (int i = 0; i < 4; i++)
     {
         wheel_speed[i] = wheel_motor[i]->measure.speed_aps;
         steer_angle[i] = steer_motor[i]->measure.total_angle;
@@ -78,7 +76,7 @@ static void AGVKinematicsCalculate()
     // 右上轮 [0]
     vx_rf = vx + wz * CHASSIS_RY_M;
     vy_rf = vy + wz * CHASSIS_RX_M;
-    
+
     // 左下轮 [2]
     vx_lb = vx - wz * CHASSIS_RY_M;
     vy_lb = vy - wz * CHASSIS_RX_M;
@@ -92,42 +90,56 @@ static void AGVKinematicsCalculate()
 
     for (int i = 0; i < 4; i++)
     {
+        // 算出这个轮子所需提供的合速度(向量模长)
         float vel = sqrtf(wheel_vx[i] * wheel_vx[i] + wheel_vy[i] * wheel_vy[i]);
 
+        // 如果要停下，就不瞎转舵盘了，保持当前舵向，纯降速
         if (vel < 0.001f)
         {
             target_wheel_speed[i] = 0.0f;
             continue;
         }
 
+        // 根据三角函数 arctan 算出各轮对应的理想朝向角度
         float target_angle = atan2f(wheel_vy[i], wheel_vx[i]) * RAD_2_DEGREE + steer_offset[i];
-        float diff = target_angle - steer_angle[i];
-        
-        while (diff > 180.0f) diff -= 360.0f;
-        while (diff < -180.0f) diff += 360.0f;
 
+        // --- 核心优化思路：最短路径转舵法 --- //
+        // 计算目标舵角和当前实际舵角之间的最小夹角
+        float diff = target_angle - steer_angle[i];
+
+        // 归一化到 [-180, 180] 之内
+        while (diff > 180.0f)
+            diff -= 360.0f;
+        while (diff < -180.0f)
+            diff += 360.0f;
+
+        // 如果舵盘需要转动超过90度才能转到目标角，那实在太慢了！
+        // 技巧：我们只需让舵盘反向转 (diff-180)度 或 (diff+180)度 即可对齐那条直线，
+        // 只不过此时轮子的朝向正好反了180度。没关系，这时候只要让“轮毂电机”反着转，底盘依旧往设定方向走！
         if (diff > 90.0f)
         {
             diff -= 180.0f;
-            wheel_dir_flag[i] = -1;
+            wheel_dir_flag[i] = -1; // 标记：轮子反转
         }
         else if (diff < -90.0f)
         {
             diff += 180.0f;
-            wheel_dir_flag[i] = -1;
+            wheel_dir_flag[i] = -1; // 标记：轮子反转
         }
         else
         {
             wheel_dir_flag[i] = 1;
         }
 
+        // 加上补偿算出最后的纯控制量，准备下发给 PID 模块
         target_steer_angle[i] = steer_angle[i] + diff;
         target_wheel_speed[i] = vel * WHEEL_SPEED_SCALE * wheel_dir_flag[i];
     }
 }
 
 /**
- * @brief 设置电机参考值
+ * @brief  将算好的目标数值，利用底层的 DJIMotorSetRef 丢进每个电调对应的结构体里的 PID_ref 中。
+ *         随后在其他地方(如 motor_task 中跑的 DJIMotorControl()) 会被循环取出作为基准进行双环 PID 解析成电流发给 CAN 总线。
  */
 static void SetMotorReference()
 {
@@ -215,7 +227,7 @@ void AGVChassisInit()
         },
         .motor_type = M3508,
     };
-    
+
     // 舵面电机初始化配置(角度环+速度环)
     Motor_Init_Config_s steer_config = {
         .can_init_config = {
@@ -249,21 +261,21 @@ void AGVChassisInit()
         },
         .motor_type = M3508,
     };
-    
+
     // 初始化4个轮毂电机 (hfdcan1, ID 1-4)
     for (uint8_t i = 0; i < 4; i++)
     {
         wheel_config.can_init_config.tx_id = i + 1;
         wheel_motor[i] = DJIMotorInit(&wheel_config);
     }
-    
+
     // 初始化4个舵面电机 (hfdcan2, ID 1-4)
     for (uint8_t i = 0; i < 4; i++)
     {
         steer_config.can_init_config.tx_id = i + 1;
         steer_motor[i] = DJIMotorInit(&steer_config);
     }
-    
+
     // 发布订阅初始化
     chassis_sub = SubRegister("chassis_cmd", sizeof(Chassis_Ctrl_Cmd_s));
     chassis_pub = PubRegister("chassis_feed", sizeof(Chassis_Upload_Data_s));
@@ -278,16 +290,16 @@ void AGVChassisTask()
 {
     // 获取新的控制信息
     SubGetMessage(chassis_sub, &chassis_cmd_recv);
-    
+
     // 运动学解算
     AGVKinematicsCalculate();
-    
+
     // 设置电机参考值
     SetMotorReference();
 
     // 反馈数据更新
     UpdateChassisFeedback();
-    
+
     // 发布反馈数据
     PubPushMessage(chassis_pub, (void *)&chassis_feedback_data);
 }

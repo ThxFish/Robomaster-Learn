@@ -6,34 +6,43 @@
 // static DaemonInstance *bmi088_daemon_instance;
 
 // ---------------------------以下私有函数,用于读写BMI088寄存器封装,blocking--------------------------------//
+
 /**
- * @brief 读取BMI088寄存器Accel. BMI088要求在不释放CS的情况下连续读取
+ * @brief 读取BMI088寄存器Accel.
+ *        由于硬件特性设计，BMI088处于SPI协议时，第一个发送过去字节用来指定我们要读的地址（寄存器编址）。
+ *        但加速度计（Acc）的硬件状态机由于要保持兼容I2C，必须在发完地址后，发一个 Dummy byte (即随便发一个垃圾数据)，
+ *        之后它才会把真实的数据吐回来。
  *
  * @param bmi088 待读取的BMI088实例
- * @param reg 待读取的寄存器地址
+ * @param reg 根据手册，待读取的寄存器地址 (0-7bit)
  * @param dataptr 读取到的数据存放的指针
- * @param len 读取长度
+ * @param len 期望读取有效数据的字节长度
  */
 static void BMI088AccelRead(BMI088Instance *bmi088, uint8_t reg, uint8_t *dataptr, uint8_t len)
 {
     if (len > 6)
         while (1)
             ;
-    // 一次读取最多6个字节,加上两个dummy data    第一个字节的第一个位是读写位,1为读,0为写,1-7bit是寄存器地址
-    static uint8_t tx[8]; // 读取,第一个字节为0x80|reg ,第二个是dummy data,后面的没用都是dummy write
-    static uint8_t rx[8]; // 前两个字节是dummy data,第三个开始是真正的数据
-    tx[0] = 0x80 | reg;   // 静态变量每次进来还是上次的值,所以要每次都要给tx[0]赋值0x80
+    // tx数组构造：tx[0] = 0x80 | reg。第一位强制置1表示这帧SPI属于读操作请求。
+    // tx[1] 开始就是 dummy data (不需要赋值，0即可)。
+    static uint8_t tx[8];
+    static uint8_t rx[8]; // rx的前两个字节将对应接收第一步地址和 dummy 阶段它发回的垃圾数据，第三个字节开始才是有效体。
+    tx[0] = 0x80 | reg;   // 静态变量每次进来还是上次的值,所以要每次都要给tx[0]赋值
     SPITransRecv(bmi088->spi_acc, rx, tx, len + 2);
-    memcpy(dataptr, rx + 2, len); // @todo : memcpy有额外开销,后续可以考虑优化,在SPI中加入接口或模式,使得在一次传输结束后不释放CS,直接接着传输
+    memcpy(dataptr, rx + 2, len); // 抛弃前2个无用字节 @todo 后续可以考虑优化
 }
 
 /**
- * @brief 读取BMI088寄存器Gyro, BMI088要求在不释放CS的情况下连续读取
+ * @brief 读取BMI088中“Gyro（陀螺仪部分）”内部寄存器。
+ *        博世（BOSCH）工程师的奇怪设计：
+ *        BMI088虽标称六轴，但是在内部其实是把两颗独立的芯片（Acc芯片和Gyro芯片）粘在一个黑色塑料封装里。
+ *        偏偏它的 Acc 部分要额外发个 Dummy byte(假信息) 才能读数据，
+ *        而它的 Gyro(角速度) 部分就很正常，读(最高位置1)一下地址寄存器，里面就立刻会通过 MOSI/MISO 返回来数据。
  *
- * @param bmi088 待读取的BMI088实例
- * @param reg  待读取的寄存器地址
- * @param dataptr 读取到的数据存放的指针
- * @param len 读取长度
+ * @param bmi088 具体绑定的芯片外设实例句柄
+ * @param reg 根据手册读取地址
+ * @param dataptr 存放目的针
+ * @param len 期望读取数据大小
  */
 static void BMI088GyroRead(BMI088Instance *bmi088, uint8_t reg, uint8_t *dataptr, uint8_t len)
 {
@@ -43,7 +52,7 @@ static void BMI088GyroRead(BMI088Instance *bmi088, uint8_t reg, uint8_t *dataptr
     // 一次读取最多6个字节,加上一个dummy data  ,第一个字节的第一个位是读写位,1为读,0为写,1-7bit是寄存器地址
     static uint8_t tx[7] = {0x80}; // 读取,第一个字节为0x80 | reg ,之后是dummy data
     static uint8_t rx[7];          // 第一个是dummy data,第三个开始是真正的数据
-    
+
     tx[0] = 0x80 | reg;
     SPITransRecv(bmi088->spi_gyro, rx, tx, len + 1);
     memcpy(dataptr, rx + 1, len); // @todo : memcpy有额外开销,后续可以考虑优化,在SPI中加入接口或模式,使得在一次传输结束后不释放CS,直接接着传输
@@ -79,19 +88,25 @@ static void BMI088GyroWriteSingleReg(BMI088Instance *bmi088, uint8_t reg, uint8_
 // -------------------------以上为私有函数,封装了BMI088寄存器读写函数,blocking--------------------------------//
 
 // -------------------------以下为私有函数,用于初始化BMI088acc和gyro的硬件和配置--------------------------------//
+// 当芯片通电后，单片机做的起手动作：配置寄存器，令这两个独立Sensor模块用多少频率上报数据、滤波范围选多少G。
 #define BMI088REG 0
 #define BMI088DATA 1
 #define BMI088ERROR 2
-// BMI088初始化配置数组for accel,第一列为reg地址,第二列为写入的配置值,第三列为错误码(如果出错)
+
+// BMI088 Accel(加速度计)初始化顺序表与宏
+// 它把我们要挨个修改的寄存器号和希望的值打包成了2维数组。
+// 比如：{BMI088_ACC_RANGE, BMI088_ACC_RANGE_6G} 代表我们设定它的最大量程为 6G (非常适合RM赛场剧烈碰撞和加速)。
 static uint8_t BMI088_Accel_Init_Table[BMI088_WRITE_ACCEL_REG_NUM][3] =
     {
         {BMI088_ACC_PWR_CTRL, BMI088_ACC_ENABLE_ACC_ON, BMI088_ACC_PWR_CTRL_ERROR},
         {BMI088_ACC_PWR_CONF, BMI088_ACC_PWR_ACTIVE_MODE, BMI088_ACC_PWR_CONF_ERROR},
-        {BMI088_ACC_CONF, BMI088_ACC_NORMAL | BMI088_ACC_800_HZ | BMI088_ACC_CONF_MUST_Set, BMI088_ACC_CONF_ERROR},
+        {BMI088_ACC_CONF, BMI088_ACC_NORMAL | BMI088_ACC_800_HZ | BMI088_ACC_CONF_MUST_Set, BMI088_ACC_CONF_ERROR}, // 800Hz数据更新率
         {BMI088_ACC_RANGE, BMI088_ACC_RANGE_6G, BMI088_ACC_RANGE_ERROR},
         {BMI088_INT1_IO_CTRL, BMI088_ACC_INT1_IO_ENABLE | BMI088_ACC_INT1_GPIO_PP | BMI088_ACC_INT1_GPIO_LOW, BMI088_INT1_IO_CTRL_ERROR},
         {BMI088_INT_MAP_DATA, BMI088_ACC_INT1_DRDY_INTERRUPT, BMI088_INT_MAP_DATA_ERROR}};
-// BMI088初始化配置数组for gyro,第一列为reg地址,第二列为写入的配置值,第三列为错误码(如果出错)
+
+// BMI088 Gyro(陀螺仪)初始化配置表：
+// 我们将量程设为了 2000 deg/s (大约是每秒可测转3圈多)，这个量程最大，保证受到炮弹高频打击震动时数据不爆表。
 static uint8_t BMI088_Gyro_Init_Table[BMI088_WRITE_GYRO_REG_NUM][3] =
     {
         {BMI088_GYRO_RANGE, BMI088_GYRO_2000, BMI088_GYRO_RANGE_ERROR},
@@ -103,10 +118,18 @@ static uint8_t BMI088_Gyro_Init_Table[BMI088_WRITE_GYRO_REG_NUM][3] =
 // @attention : 以上两个数组配合各自的初始化函数使用. 若要修改请参照BMI088 datasheet
 
 /**
- * @brief 初始化BMI088加速度计,提高可读性分拆功能
+ * @brief 给单片机开机时调用的BMI088 Accel（加速度计）启动激活协议函数。
+ *        这是非常标准的I2C/SPI Sensor起手式。
  *
- * @param bmi088 待初始化的BMI088实例
- * @return uint8_t BMI088ERROR CODE if any problems here
+ * @note  步骤：
+ *        1. BMI088比较变态，上电默认是 I2C 接口。
+ *           我们需要在 CS管脚上拉产生一个上升沿给它一次 "Fake Write(假写)" ，使它强制切换并锁定成 SPI 总线协议模式。
+ *        2. 触发芯片内建的软复位 （Soft Reset），并等待芯片重启。
+ *        3. 连续读取那个死都只回复 "0x1E" 的 `who am i` 寄存器。如果不是0x1E，证明芯片压根没焊好或者接触不良(通讯断)，直接报错返回。
+ *        4. 给芯片填入上边准备好的初始化工作频率 / G数 配置表。每写一笔，还要反过来马上读一下刚写入的地址确认有没有真的落进去了。
+ *
+ * @param bmi088 具体绑定的芯片外设实例句柄
+ * @return errocode，等于0标志正常。若包含错误码可配合灯或者串口打LOG去修它。
  */
 static uint8_t BMI088AccelInit(BMI088Instance *bmi088)
 {
@@ -194,7 +217,7 @@ static void BMI088AccSPIFinishCallback(SPIInstance *spi)
 {
     // static BMI088Instance *bmi088;
     // bmi088 = (BMI088Instance *)(spi->id);
-   
+
     // 若第一次读取加速度,则在这里启动温度读取
     // 如果使用异步姿态更新,此处唤醒量测更新的任务
 }
@@ -215,25 +238,25 @@ static void BMI088AccINTCallback(GPIOInstance *gpio)
     bmi088->update_flag.acc = 1;
     BMI088AccelRead(bmi088, BMI088_ACCEL_XOUT_L, buf, 6);
     for (uint8_t i = 0; i < 3; i++)
-            bmi088->acc[i] = bmi088->acc_coef * (float)(int16_t)(((buf[2 * i + 1]) << 8) | buf[2 * i]);
+        bmi088->acc[i] = bmi088->acc_coef * (float)(int16_t)(((buf[2 * i + 1]) << 8) | buf[2 * i]);
     // 启动加速度计数据读取(和温度读取,如果有必要),并转换为实际值
     // 读取完毕会调用BMI088AccSPIFinishCallback
 }
 
 static void BMI088GyroINTCallback(GPIOInstance *gpio)
 {
-    
+
     static BMI088Instance *bmi088;
     static uint8_t buf[6] = {0}; // 最多读取6个byte(gyro/acc,temp是2)
     bmi088 = (BMI088Instance *)(gpio->id);
     bmi088->update_flag.imu_ready = 1;
     bmi088->update_flag.gyro = 1;
     uint8_t whoami_check = 0;
-    //do{BMI088GyroRead(bmi088, BMI088_GYRO_CHIP_ID, &whoami_check, 1);}while(whoami_check != BMI088_GYRO_CHIP_ID_VALUE);
+    // do{BMI088GyroRead(bmi088, BMI088_GYRO_CHIP_ID, &whoami_check, 1);}while(whoami_check != BMI088_GYRO_CHIP_ID_VALUE);
 
     BMI088GyroRead(bmi088, BMI088_GYRO_X_L, buf, 6);
     for (uint8_t i = 0; i < 3; i++)
-            bmi088->gyro[i] = bmi088->BMI088_GYRO_SEN * (float)(int16_t)(((buf[2 * i + 1]) << 8) | buf[2 * i]);
+        bmi088->gyro[i] = bmi088->BMI088_GYRO_SEN * (float)(int16_t)(((buf[2 * i + 1]) << 8) | buf[2 * i]);
     // 启动陀螺仪数据读取,并转换为实际值
     // 读取完毕会调用BMI088GyroSPIFinishCallback
 }
@@ -271,15 +294,15 @@ uint8_t BMI088Acquire(BMI088Instance *bmi088, BMI088_Data_t *data_store)
     // 如果是IT模式,则检查标志位.当传感器数据准备好会触发外部中断,中断服务函数会将标志位置1
     if (bmi088->work_mode == BMI088_BLOCK_TRIGGER_MODE && bmi088->update_flag.imu_ready == 1)
     {
-        if(bmi088->update_flag.acc == 1)
+        if (bmi088->update_flag.acc == 1)
         {
-            memcpy(data_store->acc,bmi088->acc,3*sizeof(float));
+            memcpy(data_store->acc, bmi088->acc, 3 * sizeof(float));
             bmi088->update_flag.acc = 0;
             bmi088->update_flag.imu_ready = 0;
         }
-        if(bmi088->update_flag.gyro == 1)
+        if (bmi088->update_flag.gyro == 1)
         {
-            memcpy(data_store->gyro,bmi088->gyro,3*sizeof(float));
+            memcpy(data_store->gyro, bmi088->gyro, 3 * sizeof(float));
             bmi088->update_flag.gyro = 0;
             bmi088->update_flag.imu_ready = 0;
         }
@@ -435,8 +458,8 @@ BMI088Instance *BMI088Register(BMI088_Init_Config_s *config)
     // SPI_ACC DMA CALLBACK: 解算加速度计数据,清除温度wait标志位并启动温度传输,第二次进入中断时解算温度数据
 
     // 还有其他方案可用,比如阻塞等待传输完成,但是比较笨.
-        config->spi_acc_config.spi_work_mode = SPI_BLOCK_MODE;
-        config->spi_gyro_config.spi_work_mode = SPI_BLOCK_MODE;
+    config->spi_acc_config.spi_work_mode = SPI_BLOCK_MODE;
+    config->spi_gyro_config.spi_work_mode = SPI_BLOCK_MODE;
     // 根据参数选择工作模式
     bmi088_instance->spi_acc = SPIRegister(&config->spi_acc_config);
     bmi088_instance->spi_gyro = SPIRegister(&config->spi_gyro_config);
@@ -460,11 +483,11 @@ BMI088Instance *BMI088Register(BMI088_Init_Config_s *config)
     {
         bmi088_instance->spi_acc->spi_work_mode = SPI_DMA_MODE;
         bmi088_instance->spi_gyro->spi_work_mode = SPI_DMA_MODE;
-        
+
         // 设置回调函数
         bmi088_instance->spi_acc->callback = BMI088AccSPIFinishCallback;
         bmi088_instance->spi_gyro->callback = BMI088GyroSPIFinishCallback;
-        
+
         bmi088_instance->acc_int = GPIORegister(&config->acc_int_config); // 只有在非阻塞模式下才需要注册中断
         bmi088_instance->gyro_int = GPIORegister(&config->gyro_int_config);
 
